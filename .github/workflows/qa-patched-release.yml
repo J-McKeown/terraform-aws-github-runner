@@ -1,0 +1,153 @@
+name: QA patched release
+
+on:
+  push:
+    branches: [qa/pr-5304-release]
+    paths:
+      - .github/workflows/qa-patched-release.yml
+      - .github/qa-patched-release-notes.md
+  workflow_dispatch:
+
+concurrency:
+  group: qa-patched-release-def836bb-1
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: def836bb92c9fe2e89924618d8e4885dee86e578
+  RELEASE_TAG: qa-pr5304-def836bb-1
+  NX_DAEMON: 'false'
+  CI: 'true'
+  AWS_REGION: eu-west-1
+  TF_PLUGIN_CACHE_DIR: /tmp/terraform-plugin-cache
+
+jobs:
+  release:
+    if: github.repository == 'J-McKeown/terraform-aws-github-runner' && github.ref == 'refs/heads/qa/pr-5304-release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out release instructions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: release-workflow
+
+      - name: Check out exact candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+          path: candidate
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.11.1
+          package-manager-cache: false
+
+      - name: Verify candidate and unused release tag
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git diff --exit-code HEAD
+          gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" --jq '.[].ref' > "$RUNNER_TEMP/matching-tags"
+          if grep -Fxq "refs/tags/$RELEASE_TAG" "$RUNNER_TEMP/matching-tags"; then
+            echo "Release tag already exists; choose a new candidate tag instead of replacing assets." >&2
+            exit 1
+          fi
+
+      - name: Install pinned dependencies
+        working-directory: candidate/lambdas
+        run: node .yarn/releases/yarn-4.16.0.cjs install --immutable
+
+      - name: Verify install only reordered package metadata
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          file=lambdas/functions/termination-watcher/package.json
+          git show "HEAD:$file" | jq -S . > "$RUNNER_TEMP/package-before.json"
+          jq -S . "$file" > "$RUNNER_TEMP/package-after.json"
+          cmp "$RUNNER_TEMP/package-before.json" "$RUNNER_TEMP/package-after.json"
+          git restore --worktree -- "$file"
+          git diff --exit-code HEAD
+
+      - name: Check formatting, lint, and full Lambda test suite
+        working-directory: candidate/lambdas
+        run: |
+          set -euo pipefail
+          node .yarn/releases/yarn-4.16.0.cjs format-check
+          node .yarn/releases/yarn-4.16.0.cjs lint
+          node .yarn/releases/yarn-4.16.0.cjs test
+
+      - name: Build all five Lambda distributions
+        working-directory: candidate/lambdas
+        run: |
+          node .yarn/releases/yarn-4.16.0.cjs exec nx run-many --target=dist --skip-nx-cache --projects=@aws-github-runner/webhook,@aws-github-runner/control-plane,@aws-github-runner/gh-agent-syncer,@aws-github-runner/termination-watcher,@aws-github-runner/ami-housekeeper
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.14.0
+          terraform_wrapper: false
+
+      - name: Validate Terraform modules and mocked runner tests
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform fmt -check main.tf variables.tf modules/multi-runner/runners.tf modules/multi-runner/variables.tf modules/runners/scale-down.tf modules/runners/variables.tf
+          for module in . modules/runners modules/runners/pool modules/multi-runner; do
+            terraform -chdir="$module" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="$module" validate
+          done
+          terraform -chdir=modules/runners test -test-directory=tests
+
+      - name: Verify source and prepare release assets
+        working-directory: candidate
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git diff --exit-code HEAD
+          mkdir -p "$GITHUB_WORKSPACE/release-assets"
+          for file in lambdas/functions/webhook/webhook.zip lambdas/functions/control-plane/runners.zip lambdas/functions/gh-agent-syncer/runner-binaries-syncer.zip lambdas/functions/termination-watcher/termination-watcher.zip lambdas/functions/ami-housekeeper/ami-housekeeper.zip; do
+            unzip -t "$file"
+            unzip -Z1 "$file" | grep -Fx index.js
+            unzip -Z1 "$file" | grep -Fx package.json
+            cp "$file" "$GITHUB_WORKSPACE/release-assets/"
+          done
+          jq -n --arg repository "$SOURCE_REPOSITORY" --arg source "$SOURCE_SHA" --arg workflow "$WORKFLOW_SHA" --arg run "$RUN_URL" --arg node "$(node --version)" --arg yarn "$(cd lambdas && node .yarn/releases/yarn-4.16.0.cjs --version)" '{source_repository:$repository, source_commit:$source, workflow_commit:$workflow, workflow_run:$run, node:$node, yarn:$yarn}' > "$GITHUB_WORKSPACE/release-assets/BUILD-METADATA.json"
+          cd "$GITHUB_WORKSPACE/release-assets"
+          sha256sum ./*.zip BUILD-METADATA.json > SHA256SUMS
+
+      - name: Attest ZIPs and source metadata
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ github.workspace }}/release-assets/SHA256SUMS
+
+      - name: Create draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          set -euo pipefail
+          cp "$ATTESTATION_BUNDLE" "$GITHUB_WORKSPACE/release-assets/build-attestation.sigstore"
+          jq -r '.dsseEnvelope.payload' "$ATTESTATION_BUNDLE" | base64 -d | jq -c . > "$GITHUB_WORKSPACE/release-assets/build-attestation.intoto.jsonl"
+          cp "$GITHUB_WORKSPACE/release-workflow/.github/qa-patched-release-notes.md" "$RUNNER_TEMP/release-notes.md"
+          printf '\nAttestation: %s\n' "$ATTESTATION_URL" >> "$RUNNER_TEMP/release-notes.md"
+          gh release create "$RELEASE_TAG" --draft --prerelease --latest=false --target "$SOURCE_SHA" --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md" "$GITHUB_WORKSPACE/release-assets/"*
