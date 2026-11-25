@@ -107,7 +107,7 @@ jobs:
           mkdir -p "$TF_PLUGIN_CACHE_DIR"
           terraform fmt -check main.tf variables.tf modules/multi-runner/runners.tf modules/multi-runner/variables.tf modules/runners/scale-down.tf modules/runners/variables.tf
           for module in . modules/runners modules/runners/pool modules/multi-runner; do
-            terraform -chdir="$module" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="$module" init -backend=false -input=false
             terraform -chdir="$module" validate
           done
           terraform -chdir=modules/runners test -test-directory=tests
